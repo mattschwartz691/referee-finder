@@ -14,6 +14,7 @@ class Paper:
     published: datetime
     inspire_id: Optional[str] = None
     num_authors: int = 0
+    mainstream_index: Optional[float] = None  # 0-1, higher = more mainstream
 
     def __hash__(self):
         return hash(self.arxiv_id)
@@ -44,6 +45,7 @@ class Author:
     _rank_stage: Optional[str] = None
     # Papers with <10 authors per year: {2024: 5, 2025: 3, 2026: 1}
     small_collab_papers_by_year: Dict[int, int] = field(default_factory=dict)
+    mainstream_index: Optional[float] = None  # 0-1, average of their papers' mainstream scores
 
     @property
     def career_years(self) -> Optional[int]:

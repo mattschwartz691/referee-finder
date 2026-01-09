@@ -22,6 +22,23 @@ num_candidates = st.sidebar.slider("Number of candidates", 3, 15, 5)
 months_start = st.sidebar.slider("Papers at least N months old", 1, 6, 2)
 months_end = st.sidebar.slider("Papers at most N months old", 6, 24, 18)
 
+st.sidebar.header("Search Tuning")
+topic_weight = st.sidebar.slider(
+    "Topic match weight",
+    0.0, 2.0, 1.0, 0.1,
+    help="Higher = favor authors who work on the exact topic. Lower = favor those citing similar references."
+)
+citation_weight = st.sidebar.slider(
+    "Citation overlap weight",
+    0.0, 2.0, 1.0, 0.1,
+    help="Higher = favor authors whose papers share references with the target."
+)
+niche_only = st.sidebar.checkbox(
+    "Niche topics only",
+    value=False,
+    help="Focus on the distinctive topic (e.g., 'super-renormalizable gravity') rather than methods (e.g., 'scattering amplitudes'). Use this for interdisciplinary papers."
+)
+
 # Main input
 arxiv_id = st.text_input(
     "Enter arXiv ID or URL",
@@ -56,6 +73,18 @@ if st.button("Find Referees", type="primary"):
                 st.markdown(f"**Categories:** {', '.join(paper.categories)}")
                 st.markdown(f"**arXiv:** [{paper.arxiv_id}](https://arxiv.org/abs/{paper.arxiv_id})")
 
+            # Calculate and display mainstream index
+            status_text.text("Calculating mainstream index...")
+            progress_bar.progress(20)
+            mainstream_idx, mainstream_details = finder.inspire.calculate_mainstream_index(arxiv_id)
+            paper.mainstream_index = mainstream_idx
+
+            # Display mainstream index with interpretation
+            mainstream_label = "Niche" if mainstream_idx < 0.35 else "Moderate" if mainstream_idx < 0.6 else "Mainstream"
+            st.markdown(f"**Mainstream Index:** {mainstream_idx:.2f} ({mainstream_label})")
+            st.caption(f"Avg ref citations: {mainstream_details.get('avg_ref_citations', 'N/A')}, "
+                      f"Refs: {mainstream_details.get('num_references', 'N/A')}")
+
             status_text.text("Analyzing citation network and evaluating candidates...")
             progress_bar.progress(30)
 
@@ -63,7 +92,10 @@ if st.button("Find Referees", type="primary"):
                 arxiv_id=arxiv_id,
                 num_candidates=num_candidates,
                 months_start=months_start,
-                months_end=months_end
+                months_end=months_end,
+                topic_weight=topic_weight,
+                citation_weight=citation_weight,
+                niche_only=niche_only
             )
 
             progress_bar.progress(100)

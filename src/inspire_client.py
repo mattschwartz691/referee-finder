@@ -298,6 +298,162 @@ class InspireClient:
 
         return ref_ids
 
+    def get_paper_references_by_topic(self, arxiv_id: str, topic_keywords: List[str]) -> tuple[List[str], List[str]]:
+        """
+        Get references from a paper, separated by whether they match the topic keywords.
+        This helps find papers citing the topic-specific references rather than method references.
+
+        Returns: (topic_refs, method_refs)
+        """
+        params = {
+            "q": f"arxiv:{arxiv_id}",
+            "size": 1,
+        }
+        data = self._get("literature", params)
+
+        if not data or not data.get("hits", {}).get("hits"):
+            return [], []
+
+        metadata = data["hits"]["hits"][0].get("metadata", {})
+        references = metadata.get("references", [])
+
+        topic_refs = []
+        method_refs = []
+
+        # Expand keywords to match more variations
+        topic_kw_lower = []
+        for kw in topic_keywords:
+            kw_lower = kw.lower()
+            topic_kw_lower.append(kw_lower)
+            # Also add individual significant words from multi-word phrases
+            words = kw_lower.split()
+            for word in words:
+                if word not in ['the', 'of', 'in', 'and', 'or', 'a', 'an', 'for'] and len(word) > 4:
+                    topic_kw_lower.append(word)
+            # Add variations
+            if "super-renormalizable" in kw_lower:
+                topic_kw_lower.extend(["superrenormalizable", "super-renormaliz", "super renormalizable"])
+            if "gravity" in kw_lower:
+                topic_kw_lower.extend(["gravitational", "gravit"])
+            if "higher derivative" in kw_lower:
+                topic_kw_lower.extend(["higher-derivative", "quadratic"])
+            if "nonlocal" in kw_lower or "non-local" in kw_lower:
+                topic_kw_lower.extend(["nonlocal", "non-local", "infinite derivative"])
+
+        # Remove duplicates
+        topic_kw_lower = list(set(topic_kw_lower))
+
+        for ref in references:
+            record = ref.get("record", {})
+            ref_url = record.get("$ref", "")
+            if "/literature/" not in ref_url:
+                continue
+
+            ref_id = ref_url.split("/literature/")[-1]
+
+            # Get the reference's title to classify it
+            ref_data = self._get(f"literature/{ref_id}")
+            if not ref_data or "metadata" not in ref_data:
+                method_refs.append(ref_id)  # Default to method if can't fetch
+                continue
+
+            ref_title = ref_data["metadata"].get("titles", [{}])[0].get("title", "").lower()
+
+            # Check if title matches any topic keywords (flexible matching)
+            is_topic_ref = any(kw in ref_title for kw in topic_kw_lower if len(kw) > 3)
+
+            # Also check for specific gravity-related terms that indicate topic relevance
+            gravity_topic_terms = ["ghost free", "ghost-free", "singularity free", "singularity-free",
+                                   "f(r) gravity", "higher order gravity", "quadratic gravity",
+                                   "nonlocal gravity", "infinite derivative", "quantum gravity"]
+            if any(term in ref_title for term in gravity_topic_terms):
+                is_topic_ref = True
+
+            if is_topic_ref:
+                topic_refs.append(ref_id)
+            else:
+                method_refs.append(ref_id)
+
+        return topic_refs, method_refs
+
+    def calculate_mainstream_index(self, arxiv_id: str) -> tuple[float, dict]:
+        """
+        Calculate how mainstream a paper is based on:
+        1. Citation counts of its references (mainstream papers cite well-known works)
+        2. Total number of references (mainstream papers have more standard refs)
+        3. How recent the references are (niche work often cites older foundational papers)
+
+        Returns: (mainstream_index 0-1, details dict)
+        """
+        params = {
+            "q": f"arxiv:{arxiv_id}",
+            "size": 1,
+        }
+        data = self._get("literature", params)
+
+        if not data or not data.get("hits", {}).get("hits"):
+            return 0.5, {"error": "Paper not found"}
+
+        metadata = data["hits"]["hits"][0].get("metadata", {})
+        references = metadata.get("references", [])
+
+        if not references:
+            return 0.5, {"error": "No references found"}
+
+        # Sample some references to check their citation counts
+        ref_ids = []
+        for ref in references:
+            record = ref.get("record", {})
+            ref_url = record.get("$ref", "")
+            if "/literature/" in ref_url:
+                ref_id = ref_url.split("/literature/")[-1]
+                ref_ids.append(ref_id)
+
+        if not ref_ids:
+            return 0.5, {"error": "No linked references"}
+
+        # Check citation counts for a sample of references
+        import random
+        sample_size = min(10, len(ref_ids))
+        sample_refs = random.sample(ref_ids, sample_size)
+
+        citation_counts = []
+        for ref_id in sample_refs:
+            ref_data = self._get(f"literature/{ref_id}")
+            if ref_data and "metadata" in ref_data:
+                citations = ref_data["metadata"].get("citation_count", 0)
+                citation_counts.append(citations)
+
+        if not citation_counts:
+            return 0.5, {"error": "Could not fetch reference data"}
+
+        # Calculate metrics
+        avg_citations = sum(citation_counts) / len(citation_counts)
+        max_citations = max(citation_counts)
+
+        # Mainstream papers typically cite papers with ~100+ citations on average
+        # Niche papers cite more specialized work with fewer citations
+        # Using log scale: 10 citations = 0.3, 100 citations = 0.6, 1000 = 0.9
+        import math
+        citation_score = min(math.log10(avg_citations + 1) / 3, 1.0) if avg_citations > 0 else 0.1
+
+        # Number of references: more refs = more mainstream (typically)
+        # 20 refs = 0.3, 50 refs = 0.6, 100+ refs = 0.9
+        ref_count_score = min(len(references) / 100, 0.9)
+
+        # Combined score
+        mainstream_index = 0.7 * citation_score + 0.3 * ref_count_score
+
+        details = {
+            "avg_ref_citations": round(avg_citations, 1),
+            "max_ref_citations": max_citations,
+            "num_references": len(references),
+            "citation_score": round(citation_score, 2),
+            "ref_count_score": round(ref_count_score, 2),
+        }
+
+        return round(mainstream_index, 2), details
+
     def get_papers_citing_refs(
         self, ref_ids: List[str], months_start: int = 2, months_end: int = 12, max_results: int = 200
     ) -> List[dict]:
@@ -316,8 +472,20 @@ class InspireClient:
         date_end = now - timedelta(days=months_start * 30)
 
         # Search for papers citing these references
-        # Use fewer refs to avoid 502 errors from complex queries
-        sample_refs = ref_ids[:5]
+        # Sample refs from throughout the list, not just the first few
+        # This helps when papers bridge multiple fields
+        import random
+        if len(ref_ids) <= 5:
+            sample_refs = ref_ids
+        else:
+            # Take refs from beginning, middle, and end of reference list
+            n = len(ref_ids)
+            indices = [0, 1, n//3, 2*n//3, n-2, n-1]
+            # Add some random ones
+            indices.extend(random.sample(range(n), min(4, n)))
+            indices = list(set(i for i in indices if 0 <= i < n))[:8]
+            sample_refs = [ref_ids[i] for i in sorted(indices)]
+
         ref_query = " or ".join([f"refersto:recid:{rid}" for rid in sample_refs])
 
         params = {
@@ -375,6 +543,104 @@ class InspireClient:
             })
 
         return papers
+
+    def search_papers_by_topic(
+        self, keywords: List[str], months_start: int = 2, months_end: int = 12, max_results: int = 100
+    ) -> List[dict]:
+        """
+        Search for papers matching topic keywords.
+        This finds papers in the specific research area, not just those citing same refs.
+        """
+        from datetime import datetime, timedelta
+
+        now = datetime.now()
+        date_start = now - timedelta(days=months_end * 30)
+        date_end = now - timedelta(days=months_start * 30)
+
+        papers = []
+        seen_arxiv = set()
+
+        # Build search queries - use exact phrases for precision
+        search_queries = []
+        for kw in keywords[:5]:
+            kw_clean = kw.strip().lower()
+            if not kw_clean or len(kw_clean) < 3:
+                continue
+
+            # For gravity-related keywords, search for the exact gravity phrase
+            if "gravity" in kw_clean:
+                search_queries.append(f'"{kw_clean}"')
+                # Also add hyphenated version
+                if " " in kw_clean:
+                    search_queries.append(f'"{kw_clean.replace(" ", "-")}"')
+
+            # For super-renormalizable, search multiple variations
+            if "super-renormalizable" in kw_clean or "superrenormalizable" in kw_clean:
+                search_queries.append('"super-renormalizable gravity"')
+                search_queries.append('"superrenormalizable gravity"')
+                search_queries.append('"higher derivative gravity"')
+                search_queries.append('"higher-derivative gravity"')
+                search_queries.append('"quadratic gravity"')
+                search_queries.append('"nonlocal gravity"')
+
+            # For other keywords, add as-is
+            if "gravity" not in kw_clean:
+                search_queries.append(f'"{kw_clean}"')
+
+        # Remove duplicates
+        search_queries = list(dict.fromkeys(search_queries))
+
+        # Search INSPIRE
+        for query in search_queries[:8]:
+            # Search in title first (more precise)
+            params = {
+                "q": f't {query}',
+                "size": 40,
+                "sort": "mostrecent",
+            }
+            data = self._get("literature", params)
+
+            if data and "hits" in data:
+                for hit in data["hits"].get("hits", []):
+                    metadata = hit.get("metadata", {})
+                    arxiv_eprints = metadata.get("arxiv_eprints", [])
+                    if not arxiv_eprints:
+                        continue
+
+                    arxiv_id = arxiv_eprints[0].get("value")
+                    if arxiv_id in seen_arxiv:
+                        continue
+
+                    # Filter by date
+                    earliest = metadata.get("earliest_date", "")
+                    try:
+                        pub_date = datetime.strptime(earliest, "%Y-%m-%d")
+                    except ValueError:
+                        try:
+                            pub_date = datetime.strptime(earliest, "%Y-%m")
+                        except ValueError:
+                            continue
+
+                    if not (date_start <= pub_date <= date_end):
+                        continue
+
+                    seen_arxiv.add(arxiv_id)
+                    papers.append({
+                        "arxiv_id": arxiv_id,
+                        "title": metadata.get("titles", [{}])[0].get("title", ""),
+                        "authors": [a.get("full_name", "") for a in metadata.get("authors", [])[:10]],
+                        "num_authors": len(metadata.get("authors", [])),
+                        "shared_refs": 0,
+                        "topic_match": True,
+                        "earliest_date": earliest,
+                        "abstracts": metadata.get("abstracts", [{}])[0].get("value", ""),
+                        "categories": metadata.get("arxiv_categories", []),
+                    })
+
+            if len(papers) >= max_results:
+                break
+
+        return papers[:max_results]
 
     def find_citing_authors(
         self, arxiv_id: str, months_start: int = 2, months_end: int = 12
