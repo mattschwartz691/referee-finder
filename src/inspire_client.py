@@ -36,12 +36,21 @@ class InspireClient:
     def _get(self, endpoint: str, params: dict = None) -> Optional[dict]:
         self._rate_limit()
         url = f"{self.BASE_URL}/{endpoint}"
-        try:
-            response = self.session.get(url, params=params, timeout=30)
-            response.raise_for_status()
-            return response.json()
-        except requests.RequestException:
-            return None
+        max_retries = 3
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(url, params=params, timeout=30)
+                response.raise_for_status()
+                return response.json()
+            except requests.RequestException as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    time.sleep(2)  # Longer wait
+                    continue
+        if last_error:
+            print(f"INSPIRE API error after {max_retries} retries: {last_error}")
+        return None
 
     def search_author(self, name: str) -> Optional[dict]:
         name_parts = name.split()
@@ -264,3 +273,160 @@ class InspireClient:
         paper_normalized = {self._normalize_name(a) for a in paper_authors}
 
         return bool(collab_normalized & paper_normalized)
+
+    def get_paper_references(self, arxiv_id: str) -> List[str]:
+        """Get INSPIRE record IDs of papers referenced by this paper."""
+        params = {
+            "q": f"arxiv:{arxiv_id}",
+            "size": 1,
+        }
+        data = self._get("literature", params)
+
+        if not data or not data.get("hits", {}).get("hits"):
+            return []
+
+        metadata = data["hits"]["hits"][0].get("metadata", {})
+        references = metadata.get("references", [])
+
+        ref_ids = []
+        for ref in references:
+            record = ref.get("record", {})
+            ref_url = record.get("$ref", "")
+            if "/literature/" in ref_url:
+                ref_id = ref_url.split("/literature/")[-1]
+                ref_ids.append(ref_id)
+
+        return ref_ids
+
+    def get_papers_citing_refs(
+        self, ref_ids: List[str], months_start: int = 2, months_end: int = 12, max_results: int = 200
+    ) -> List[dict]:
+        """
+        Find papers that cite any of the given reference IDs.
+        Returns papers published in the date range that share references.
+        """
+        if not ref_ids:
+            return []
+
+        from datetime import datetime, timedelta
+
+        # Calculate date range
+        now = datetime.now()
+        date_start = now - timedelta(days=months_end * 30)
+        date_end = now - timedelta(days=months_start * 30)
+
+        # Search for papers citing these references
+        # Use fewer refs to avoid 502 errors from complex queries
+        sample_refs = ref_ids[:5]
+        ref_query = " or ".join([f"refersto:recid:{rid}" for rid in sample_refs])
+
+        params = {
+            "q": f"({ref_query})",
+            "size": max_results,
+            "sort": "mostrecent",
+        }
+        data = self._get("literature", params)
+
+        if not data or "hits" not in data:
+            return []
+
+        # Filter by date in Python (to avoid complex INSPIRE query)
+        hits_list = []
+        for hit in data["hits"].get("hits", []):
+            metadata = hit.get("metadata", {})
+            earliest = metadata.get("earliest_date", "")
+            try:
+                pub_date = datetime.strptime(earliest, "%Y-%m-%d")
+            except ValueError:
+                try:
+                    pub_date = datetime.strptime(earliest, "%Y-%m")
+                except ValueError:
+                    continue
+            if date_start <= pub_date <= date_end:
+                hits_list.append(hit)
+
+        papers = []
+        for hit in hits_list:
+            metadata = hit.get("metadata", {})
+            arxiv_eprints = metadata.get("arxiv_eprints", [])
+            if not arxiv_eprints:
+                continue
+
+            # Count how many of our refs this paper cites
+            paper_refs = metadata.get("references", [])
+            paper_ref_ids = set()
+            for ref in paper_refs:
+                record = ref.get("record", {})
+                ref_url = record.get("$ref", "")
+                if "/literature/" in ref_url:
+                    paper_ref_ids.add(ref_url.split("/literature/")[-1])
+
+            shared_refs = len(set(ref_ids) & paper_ref_ids)
+
+            papers.append({
+                "arxiv_id": arxiv_eprints[0].get("value"),
+                "title": metadata.get("titles", [{}])[0].get("title", ""),
+                "authors": [a.get("full_name", "") for a in metadata.get("authors", [])[:10]],
+                "num_authors": len(metadata.get("authors", [])),
+                "shared_refs": shared_refs,
+                "earliest_date": metadata.get("earliest_date", ""),
+                "abstracts": metadata.get("abstracts", [{}])[0].get("value", ""),
+                "categories": metadata.get("arxiv_categories", []),
+            })
+
+        return papers
+
+    def find_citing_authors(
+        self, arxiv_id: str, months_start: int = 2, months_end: int = 12
+    ) -> List[dict]:
+        """
+        Find authors of papers that cite the target paper.
+        These are people actively engaging with this work.
+        """
+        from datetime import datetime, timedelta
+
+        now = datetime.now()
+        date_start = now - timedelta(days=months_end * 30)
+        date_end = now - timedelta(days=months_start * 30)
+
+        # First get the INSPIRE record ID for this paper
+        params = {
+            "q": f"arxiv:{arxiv_id}",
+            "size": 1,
+        }
+        data = self._get("literature", params)
+
+        if not data or not data.get("hits", {}).get("hits"):
+            return []
+
+        record_id = data["hits"]["hits"][0].get("id")
+        if not record_id:
+            return []
+
+        # Find papers citing this one
+        params = {
+            "q": f"citedrecid:{record_id} and date >= {date_start.strftime('%Y-%m-%d')} and date <= {date_end.strftime('%Y-%m-%d')}",
+            "size": 100,
+            "sort": "mostrecent",
+        }
+        citing_data = self._get("literature", params)
+
+        if not citing_data or "hits" not in citing_data:
+            return []
+
+        authors_info = []
+        for hit in citing_data["hits"].get("hits", []):
+            metadata = hit.get("metadata", {})
+            arxiv_eprints = metadata.get("arxiv_eprints", [])
+            if not arxiv_eprints:
+                continue
+
+            for author in metadata.get("authors", [])[:5]:  # First 5 authors
+                authors_info.append({
+                    "name": author.get("full_name", ""),
+                    "paper_arxiv": arxiv_eprints[0].get("value"),
+                    "paper_title": metadata.get("titles", [{}])[0].get("title", ""),
+                    "citing": True,
+                })
+
+        return authors_info

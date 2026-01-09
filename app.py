@@ -14,13 +14,13 @@ st.set_page_config(
 )
 
 st.title("EJPC Referee Finder")
-st.markdown("Find suitable referees for physics papers using arXiv and INSPIRE-HEP")
+st.markdown("Find suitable referees for physics papers using citation network analysis")
 
 # Sidebar settings
 st.sidebar.header("Settings")
 num_candidates = st.sidebar.slider("Number of candidates", 3, 15, 5)
 months_start = st.sidebar.slider("Papers at least N months old", 1, 6, 2)
-months_end = st.sidebar.slider("Papers at most N months old", 6, 24, 12)
+months_end = st.sidebar.slider("Papers at most N months old", 6, 24, 18)
 
 # Main input
 arxiv_id = st.text_input(
@@ -56,7 +56,7 @@ if st.button("Find Referees", type="primary"):
                 st.markdown(f"**Categories:** {', '.join(paper.categories)}")
                 st.markdown(f"**arXiv:** [{paper.arxiv_id}](https://arxiv.org/abs/{paper.arxiv_id})")
 
-            status_text.text("Searching for similar papers and evaluating candidates...")
+            status_text.text("Analyzing citation network and evaluating candidates...")
             progress_bar.progress(30)
 
             candidates = finder.find_referees(
@@ -92,7 +92,7 @@ if st.button("Find Referees", type="primary"):
                             st.markdown(f"**Papers (<10 authors):** {author.publication_activity_str}")
 
                             # Relevant papers with dates
-                            st.markdown("**Relevant Papers:**")
+                            st.markdown("**Papers sharing references with target:**")
                             for p in candidate.relevant_papers[:3]:
                                 title_short = p.title[:70] + "..." if len(p.title) > 70 else p.title
                                 st.markdown(f"- [{title_short}](https://arxiv.org/abs/{p.arxiv_id}) ({p.pub_date_str})")

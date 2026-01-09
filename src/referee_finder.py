@@ -1,5 +1,6 @@
-from typing import List
+from typing import List, Dict
 from collections import defaultdict
+from datetime import datetime
 
 from .models import Paper, RefereeCandidate
 from .arxiv_client import ArxivClient
@@ -8,7 +9,7 @@ from .utils import extract_keywords, names_match, calculate_relevance_score
 
 
 class RefereeFinder:
-    """Main class for finding suitable referees."""
+    """Main class for finding suitable referees using citation network analysis."""
 
     def __init__(self, verbose: bool = True):
         self.arxiv = ArxivClient()
@@ -26,6 +27,15 @@ class RefereeFinder:
         months_start: int = 2,
         months_end: int = 12
     ) -> List[RefereeCandidate]:
+        """
+        Find suitable referee candidates using citation network analysis.
+
+        Strategy:
+        1. Get the paper's references from INSPIRE
+        2. Find other papers that cite the same references (co-citation)
+        3. Authors of co-citing papers are likely in the same field
+        4. Rank by number of shared references and filter by career criteria
+        """
         # Step 1: Fetch the target paper
         self.log(f"Fetching paper {arxiv_id}...")
         paper = self.arxiv.fetch_paper(arxiv_id)
@@ -33,37 +43,69 @@ class RefereeFinder:
             raise ValueError(f"Could not fetch paper {arxiv_id}")
 
         self.log(f"Title: {paper.title}")
-        self.log(f"Authors: {', '.join(paper.authors[:5])}...")
+        self.log(f"Authors: {', '.join(paper.authors[:5])}{'...' if len(paper.authors) > 5 else ''}")
         self.log(f"Categories: {', '.join(paper.categories)}")
 
-        # Step 2: Extract keywords
-        keywords = extract_keywords(paper.title, paper.abstract)
-        self.log(f"Keywords: {', '.join(keywords[:5])}...")
+        # Step 2: Get references from INSPIRE
+        self.log("\nAnalyzing citation network...")
+        ref_ids = self.inspire.get_paper_references(arxiv_id)
+        self.log(f"Found {len(ref_ids)} references in INSPIRE")
 
-        # Step 3: Search for similar papers
-        self.log(f"\nSearching for similar papers ({months_start}-{months_end} months ago)...")
-        categories = [c for c in paper.categories if c in ["hep-ph", "hep-th"]]
-        if not categories:
-            categories = ["hep-ph", "hep-th"]
-
-        similar_papers = self.arxiv.search_similar_papers(
-            categories=categories,
-            keywords=keywords,
-            months_ago_start=months_start,
-            months_ago_end=months_end,
-            max_results=200
+        # Step 3: Find papers that cite the same references (co-citation analysis)
+        self.log(f"Finding papers that share references ({months_start}-{months_end} months ago)...")
+        co_citing_papers = self.inspire.get_papers_citing_refs(
+            ref_ids,
+            months_start=months_start,
+            months_end=months_end,
+            max_results=300
         )
-        self.log(f"Found {len(similar_papers)} potentially relevant papers")
+        self.log(f"Found {len(co_citing_papers)} potentially relevant papers")
 
-        # Step 4: Collect candidate authors
+        # Step 4: Collect candidate authors weighted by shared references
         self.log("\nCollecting candidate authors...")
-        author_papers = defaultdict(list)
-        for sim_paper in similar_papers:
-            for author in sim_paper.authors:
-                if not self._is_paper_author(author, paper.authors):
-                    author_papers[author].append(sim_paper)
+        author_data: Dict[str, dict] = defaultdict(lambda: {
+            "papers": [],
+            "shared_refs_total": 0,
+            "max_shared_refs": 0
+        })
 
-        self.log(f"Found {len(author_papers)} unique potential referees")
+        for cp in co_citing_papers:
+            # Skip papers with too many authors (likely collaborations)
+            if cp["num_authors"] > 15:
+                continue
+
+            for author_name in cp["authors"]:
+                # Skip if author is on the target paper
+                if self._is_paper_author(author_name, paper.authors):
+                    continue
+
+                # Create Paper object for tracking
+                try:
+                    pub_date = datetime.strptime(cp["earliest_date"], "%Y-%m-%d")
+                except ValueError:
+                    try:
+                        pub_date = datetime.strptime(cp["earliest_date"], "%Y-%m")
+                    except ValueError:
+                        pub_date = datetime.now()
+
+                rel_paper = Paper(
+                    arxiv_id=cp["arxiv_id"],
+                    title=cp["title"],
+                    abstract=cp.get("abstracts", ""),
+                    authors=cp["authors"],
+                    categories=cp.get("categories", []),
+                    published=pub_date,
+                    num_authors=cp["num_authors"]
+                )
+
+                author_data[author_name]["papers"].append(rel_paper)
+                author_data[author_name]["shared_refs_total"] += cp["shared_refs"]
+                author_data[author_name]["max_shared_refs"] = max(
+                    author_data[author_name]["max_shared_refs"],
+                    cp["shared_refs"]
+                )
+
+        self.log(f"Found {len(author_data)} unique potential referees")
 
         # Step 5: Filter and rank candidates
         self.log("\nEvaluating candidates...")
@@ -71,14 +113,15 @@ class RefereeFinder:
         evaluated = 0
         skipped_reasons = defaultdict(int)
 
+        # Sort by total shared references (most relevant first)
         sorted_authors = sorted(
-            author_papers.items(),
-            key=lambda x: len(x[1]),
+            author_data.items(),
+            key=lambda x: (x[1]["shared_refs_total"], len(x[1]["papers"])),
             reverse=True
         )
 
-        for author_name, relevant_papers in sorted_authors:
-            if len(candidates) >= num_candidates * 2:
+        for author_name, data in sorted_authors:
+            if len(candidates) >= num_candidates * 3:
                 break
 
             evaluated += 1
@@ -108,26 +151,25 @@ class RefereeFinder:
                 skipped_reasons["conflict"] += 1
                 continue
 
-            # Check if still active and get publication counts
+            # Get publication counts (don't filter on inactive since they have relevant papers)
             papers_3yr, small_collab_counts = self.inspire.get_author_papers_with_counts(
                 author_name, years=3, max_results=100
             )
-            if not papers_3yr:
-                skipped_reasons["inactive"] += 1
-                continue
 
             # Store publication activity
             author_info.small_collab_papers_by_year = small_collab_counts
-            author_info.recent_papers = relevant_papers
+            author_info.recent_papers = data["papers"]
 
-            # Calculate relevance score
-            relevance = calculate_relevance_score(
-                relevant_papers, keywords, paper.categories
-            )
+            # Calculate relevance score based on shared references
+            # Higher score = more shared references with target paper
+            max_possible_refs = min(len(ref_ids), 10)  # We sample up to 10 refs
+            ref_score = data["shared_refs_total"] / max(max_possible_refs * len(data["papers"]), 1)
+            paper_count_bonus = min(len(data["papers"]) * 0.1, 0.3)
+            relevance = min(ref_score + paper_count_bonus, 1.0)
 
             candidate = RefereeCandidate(
                 author=author_info,
-                relevant_papers=relevant_papers,
+                relevant_papers=data["papers"],
                 relevance_score=relevance
             )
             candidates.append(candidate)
@@ -159,18 +201,15 @@ class RefereeFinder:
             if author.institution:
                 lines.append(f"   Institution: {author.institution}")
 
-            # Career info: PhD year, first pub, etc.
             lines.append(f"   Career: {author.career_info_str}")
             if author.career_stage:
                 lines.append(f"   Stage: {author.career_stage}")
 
-            # Publication activity (papers with <10 authors)
             lines.append(f"   Papers (<10 authors): {author.publication_activity_str}")
-
             lines.append(f"   Relevance Score: {candidate.relevance_score:.2f}")
 
             if candidate.relevant_papers:
-                lines.append("   Relevant Papers:")
+                lines.append("   Relevant Papers (share references with target):")
                 for paper in candidate.relevant_papers[:3]:
                     title_short = paper.title[:55] + "..." if len(paper.title) > 55 else paper.title
                     lines.append(f"   - \"{title_short}\"")
