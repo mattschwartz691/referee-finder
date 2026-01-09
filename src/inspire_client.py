@@ -1,7 +1,8 @@
 import requests
 import time
+from collections import defaultdict
 from datetime import datetime
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Dict
 from .models import Author, Paper
 
 
@@ -10,7 +11,6 @@ class InspireClient:
 
     BASE_URL = "https://inspirehep.net/api"
 
-    # Map INSPIRE ranks to our career stages
     RANK_MAP = {
         "UNDERGRADUATE": "Graduate Student",
         "MASTER": "Graduate Student",
@@ -19,7 +19,7 @@ class InspireClient:
         "JUNIOR": "Junior Faculty",
         "SENIOR": "Senior",
         "STAFF": "Mid-Career",
-        "VISITOR": None,  # Don't use rank
+        "VISITOR": None,
     }
 
     def __init__(self, delay: float = 0.3):
@@ -28,25 +28,22 @@ class InspireClient:
         self._last_request = 0
 
     def _rate_limit(self):
-        """Ensure we don't exceed rate limits."""
         elapsed = time.time() - self._last_request
         if elapsed < self.delay:
             time.sleep(self.delay - elapsed)
         self._last_request = time.time()
 
     def _get(self, endpoint: str, params: dict = None) -> Optional[dict]:
-        """Make a GET request to INSPIRE API."""
         self._rate_limit()
         url = f"{self.BASE_URL}/{endpoint}"
         try:
             response = self.session.get(url, params=params, timeout=30)
             response.raise_for_status()
             return response.json()
-        except requests.RequestException as e:
+        except requests.RequestException:
             return None
 
     def search_author(self, name: str) -> Optional[dict]:
-        """Search for an author by name and return best match."""
         name_parts = name.split()
         if len(name_parts) >= 2:
             search_name = f"{name_parts[-1]}, {name_parts[0]}"
@@ -63,10 +60,7 @@ class InspireClient:
             return None
 
         hits = data["hits"].get("hits", [])
-        if not hits:
-            return None
-
-        return hits[0]
+        return hits[0] if hits else None
 
     def get_author_info(self, name: str) -> Optional[Author]:
         """Get full author information including career data."""
@@ -87,6 +81,9 @@ class InspireClient:
         # Extract institution and rank from positions
         institution = None
         current_rank = None
+        phd_year = None
+        phd_institution = None
+        first_paper_year = None
         positions = metadata.get("positions", [])
 
         for pos in positions:
@@ -100,10 +97,22 @@ class InspireClient:
             if not current_rank:
                 current_rank = positions[0].get("rank")
 
-        # Get first paper year - try to estimate from first position
-        first_paper_year = None
+        # Find PhD position and earliest position
+        for pos in positions:
+            rank = pos.get("rank")
+            start = pos.get("start_date")
+            end = pos.get("end_date")
 
-        # Try to get from first position (PhD start is rough proxy)
+            # Extract PhD info
+            if rank == "PHD":
+                if end:
+                    try:
+                        phd_year = int(end.split("-")[0])
+                    except (ValueError, IndexError):
+                        pass
+                phd_institution = pos.get("institution")
+
+        # Get first paper year from earliest position
         for pos in reversed(positions):
             start = pos.get("start_date")
             if start:
@@ -113,8 +122,6 @@ class InspireClient:
                 except (ValueError, IndexError):
                     pass
 
-        # If we have current rank, use that to estimate career stage
-        # Otherwise we'll calculate from first_paper_year
         author_name = metadata.get("name", {}).get("value", name)
         if not author_name:
             author_name = metadata.get("name", {}).get("preferred_name", name)
@@ -124,10 +131,11 @@ class InspireClient:
             inspire_id=inspire_id,
             orcid=orcid,
             institution=institution,
-            first_paper_year=first_paper_year
+            first_paper_year=first_paper_year,
+            phd_year=phd_year,
+            phd_institution=phd_institution
         )
 
-        # Override career stage if we have a reliable rank
         if current_rank and current_rank in self.RANK_MAP:
             mapped_stage = self.RANK_MAP[current_rank]
             if mapped_stage:
@@ -135,14 +143,18 @@ class InspireClient:
 
         return author
 
-    def get_author_papers(
-        self, author_name: str, years: int = 3, max_results: int = 50
-    ) -> List[Paper]:
-        """Get recent papers by an author."""
+    def get_author_papers_with_counts(
+        self, author_name: str, years: int = 3, max_results: int = 100
+    ) -> tuple[List[Paper], Dict[int, int]]:
+        """
+        Get recent papers by an author and count small-collaboration papers by year.
+
+        Returns:
+            Tuple of (list of papers, dict mapping year -> count of papers with <10 authors)
+        """
         current_year = datetime.now().year
         start_year = current_year - years
 
-        # Clean author name for search
         name_parts = author_name.split()
         if len(name_parts) >= 2:
             search_name = f"{name_parts[-1]}, {name_parts[0]}"
@@ -157,9 +169,11 @@ class InspireClient:
         data = self._get("literature", params)
 
         if not data or "hits" not in data:
-            return []
+            return [], {}
 
         papers = []
+        small_collab_by_year: Dict[int, int] = defaultdict(int)
+
         for hit in data["hits"].get("hits", []):
             metadata = hit.get("metadata", {})
 
@@ -175,6 +189,7 @@ class InspireClient:
             abstract = abstracts[0].get("value") if abstracts else ""
 
             authors_data = metadata.get("authors", [])
+            num_authors = len(authors_data)
             authors = [a.get("full_name", "") for a in authors_data[:10]]
 
             categories = metadata.get("arxiv_categories", [])
@@ -195,14 +210,25 @@ class InspireClient:
                 authors=authors,
                 categories=categories,
                 published=pub_date,
-                inspire_id=hit.get("id")
+                inspire_id=hit.get("id"),
+                num_authors=num_authors
             )
             papers.append(paper)
 
+            # Count small-collaboration papers (<10 authors)
+            if num_authors < 10:
+                small_collab_by_year[pub_date.year] += 1
+
+        return papers, dict(small_collab_by_year)
+
+    def get_author_papers(
+        self, author_name: str, years: int = 3, max_results: int = 50
+    ) -> List[Paper]:
+        """Get recent papers by an author."""
+        papers, _ = self.get_author_papers_with_counts(author_name, years, max_results)
         return papers
 
     def get_collaborators(self, author_name: str, years: int = 3) -> Set[str]:
-        """Get all co-authors of an author in the past N years."""
         papers = self.get_author_papers(author_name, years=years, max_results=100)
 
         collaborators = set()
@@ -216,7 +242,6 @@ class InspireClient:
         return collaborators
 
     def is_active(self, author_name: str, months: int = 12) -> bool:
-        """Check if author has published in last N months."""
         papers = self.get_author_papers(author_name, years=2, max_results=10)
         if not papers:
             return False
@@ -225,7 +250,6 @@ class InspireClient:
         return any(p.published >= cutoff for p in papers)
 
     def _normalize_name(self, name: str) -> str:
-        """Normalize author name for comparison."""
         if "," in name:
             parts = name.split(",")
             name = " ".join(reversed([p.strip() for p in parts]))
@@ -234,7 +258,6 @@ class InspireClient:
     def check_collaboration(
         self, author_name: str, paper_authors: List[str], years: int = 3
     ) -> bool:
-        """Check if author has collaborated with any of the paper authors."""
         collaborators = self.get_collaborators(author_name, years=years)
 
         collab_normalized = {self._normalize_name(c) for c in collaborators}

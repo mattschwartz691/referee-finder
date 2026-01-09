@@ -6,7 +6,6 @@ Run with: streamlit run app.py
 
 import streamlit as st
 from src.referee_finder import RefereeFinder
-from src.arxiv_client import ArxivClient
 
 st.set_page_config(
     page_title="EJPC Referee Finder",
@@ -33,15 +32,12 @@ if st.button("Find Referees", type="primary"):
     if not arxiv_id.strip():
         st.error("Please enter an arXiv ID")
     else:
-        # Create progress indicators
         progress_bar = st.progress(0)
         status_text = st.empty()
 
         try:
-            # Initialize clients
             finder = RefereeFinder(verbose=False)
 
-            # Step 1: Fetch paper
             status_text.text("Fetching paper from arXiv...")
             progress_bar.progress(10)
 
@@ -60,8 +56,7 @@ if st.button("Find Referees", type="primary"):
                 st.markdown(f"**Categories:** {', '.join(paper.categories)}")
                 st.markdown(f"**arXiv:** [{paper.arxiv_id}](https://arxiv.org/abs/{paper.arxiv_id})")
 
-            # Step 2: Find referees
-            status_text.text("Searching for similar papers...")
+            status_text.text("Searching for similar papers and evaluating candidates...")
             progress_bar.progress(30)
 
             candidates = finder.find_referees(
@@ -82,19 +77,25 @@ if st.button("Find Referees", type="primary"):
             else:
                 for i, candidate in enumerate(candidates, 1):
                     author = candidate.author
-                    with st.expander(f"**{i}. {author.name}** - {author.career_stage or 'Unknown'} ({candidate.relevance_score:.2f})", expanded=(i <= 3)):
+                    header = f"**{i}. {author.name}** - {author.career_stage or 'Unknown'} (score: {candidate.relevance_score:.2f})"
+                    with st.expander(header, expanded=(i <= 3)):
                         col1, col2 = st.columns([2, 1])
 
                         with col1:
                             if author.institution:
                                 st.markdown(f"**Institution:** {author.institution}")
-                            if author.career_years:
-                                st.markdown(f"**Career:** {author.career_stage} ({author.career_years} years)")
 
+                            # Career details
+                            st.markdown(f"**Career:** {author.career_info_str}")
+
+                            # Publication activity
+                            st.markdown(f"**Papers (<10 authors):** {author.publication_activity_str}")
+
+                            # Relevant papers with dates
                             st.markdown("**Relevant Papers:**")
-                            for paper in candidate.relevant_papers[:3]:
-                                title_short = paper.title[:80] + "..." if len(paper.title) > 80 else paper.title
-                                st.markdown(f"- [{title_short}](https://arxiv.org/abs/{paper.arxiv_id})")
+                            for p in candidate.relevant_papers[:3]:
+                                title_short = p.title[:70] + "..." if len(p.title) > 70 else p.title
+                                st.markdown(f"- [{title_short}](https://arxiv.org/abs/{p.arxiv_id}) ({p.pub_date_str})")
 
                         with col2:
                             st.markdown(f"**Relevance Score:** {candidate.relevance_score:.2f}")
